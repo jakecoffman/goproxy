@@ -14,11 +14,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -435,6 +437,65 @@ func TestSimpleMitm(t *testing.T) {
 	}
 	if resp := string(getOrFail(https.URL+"/query?result=bar", client, t)); resp != "bar" {
 		t.Error("Wrong response when mitm", resp, "expected bar")
+	}
+}
+
+func TestMitmConnectionReuse(t *testing.T) {
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest(goproxy.ReqHostIs(https.Listener.Addr().String())).HandleConnect(goproxy.AlwaysMitm)
+	proxy.OnRequest(goproxy.ReqHostIs("no such host exists")).HandleConnect(goproxy.AlwaysMitm)
+
+	client, l := oneShotProxy(proxy, t)
+	defer l.Close()
+
+	var dials atomic.Uint32
+	clientTrace := &httptrace.ClientTrace{
+		ConnectDone: func(network, addr string, err error) {
+			dials.Add(1)
+		},
+	}
+	traceCtx := httptrace.WithClientTrace(context.Background(), clientTrace)
+
+	doRequest := func(headers http.Header) {
+		req, err := http.NewRequestWithContext(traceCtx, "GET", https.URL+"/bobo", nil)
+		if err != nil {
+			t.Fatal("create new request", err)
+		}
+		req.Header = headers
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal("do request", err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal("read body", err)
+		}
+		if string(body) != "bobo" {
+			t.Fatal("wrong body", string(body))
+		}
+		if err = resp.Body.Close(); err != nil {
+			t.Fatal("close body", err)
+		}
+	}
+
+	closeHeader := http.Header{"Connection": []string{"close"}}
+	doRequest(closeHeader)
+	doRequest(closeHeader)
+	doRequest(closeHeader)
+	doRequest(closeHeader)
+
+	if dials.Load() != 4 {
+		t.Errorf("expected 4 dials, got %d", dials.Load())
+	}
+
+	dials.Store(0)
+	doRequest(nil)
+	doRequest(nil)
+	doRequest(nil)
+	doRequest(nil)
+
+	if dials.Load() != 1 {
+		t.Errorf("expected connection reuse, got %d dials", dials.Load())
 	}
 }
 
